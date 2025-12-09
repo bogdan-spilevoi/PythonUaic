@@ -1,5 +1,8 @@
+import datetime
+from ftplib import FTP
 import os
 from pathlib import Path
+import tempfile
 import zipfile
 from path_utilities import is_valid_path, is_valid_file, read_file_safely
 import argparse
@@ -8,6 +11,8 @@ from watchdog.events import FileSystemEventHandler
 import time
 from handlers import Handler
 from result import Result
+from io import BytesIO
+import zipfile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--file", action="store_true")
@@ -22,6 +27,9 @@ def main():
     get_paths()
     if(paths == None or len(paths) == 0):
         return
+    
+    init_sync()
+    return
     
     print(paths)
     init_handlers(paths)
@@ -136,7 +144,34 @@ def get_paths():
     return paths
 
 def init_sync():
-    a=0
+    latest_files = {}
+    for path in paths:
+        files_in_path = ls(path)
+        #print(files_in_path)
+        for rel_path, (path, mtime) in files_in_path.items():
+            if rel_path in latest_files:
+                _, existing_mtime = latest_files[rel_path]
+                if mtime > existing_mtime:
+                    latest_files[rel_path] = (path, mtime)
+            else:
+                latest_files[rel_path] = (path, mtime)
+
+    #print("Latest files", latest_files)
+    for path in paths:
+        files_in_path = ls(path)
+        _, mtime = files_in_path[rel_path]
+        for rel_path, (latest_path, latest_mtime) in latest_files.items():
+            if rel_path not in files_in_path.keys():
+                print(f"[LOG] File [{rel_path}] not found in [{path["path"]}], writing latest from [{latest_path["path"]}]")
+                write(rel_path, path, get_bytes(rel_path, latest_path))
+            else:               
+                #print(f"[LOG] {time.ctime(mtime)} < {time.ctime(latest_mtime)}")
+                if mtime < latest_mtime:
+                    print(f"[LOG] File [{rel_path}] from [{path["path"]}] [{time.ctime(mtime)}] is behind latest, writing from [{latest_path["path"]}] [{time.ctime(latest_mtime)}]")
+                    write(rel_path, path, get_bytes(rel_path, latest_path))
+
+    
+
 
 def init_handlers(paths):   
     for path in paths:
@@ -163,9 +198,197 @@ def moved(root, old_rel, new_rel):
     print("[MOVED]", root, ":", old_rel, "->", new_rel)
 
 
+def ls(path):
+    folder_list = {}
+    if path["type"] == "folder":       
+        for root, dirs, files in os.walk(path["path"]):
+            for file in files:
+                full_path = os.path.join(root, file)
+                modified = os.path.getmtime(full_path)
 
-def make_key(root, relative):
-    return os.path.join(root, relative)
+                rel_path = os.path.relpath(full_path, path["path"])
+
+                folder_list[rel_path] = (path, modified)
+
+    if path["type"] == "zip":
+        zip_path = path["path"]
+
+        with zipfile.ZipFile(zip_path, "r") as z:
+            for info in z.infolist():
+                if info.is_dir():
+                    continue
+
+                rel_path = info.filename
+                parts = rel_path.split("/", 1)
+                if len(parts) == 2:
+                    rel_path = parts[1]
+                
+                modified_ts = time.mktime(info.date_time + (0, 0, -1))
+
+                folder_list[rel_path] = (path, modified_ts)
+    if path["type"] == "ftp":
+        ftp = FTP()
+        ftp.connect(path["host"])
+        ftp.login(path["username"], path["password"])
+
+        base_remote = path["path"]
+
+        def walk_ftp(current_remote_path):
+            lines = []
+            ftp.retrlines("LIST " + current_remote_path, lines.append)
+
+            for line in lines:
+                parts = line.split(maxsplit=8)
+                name = parts[-1]
+                item_path = current_remote_path.rstrip("/") + "/" + name
+
+                is_dir = line.startswith("d")
+
+                if is_dir:
+                    walk_ftp(item_path)
+                else:
+                    try:
+                        resp = ftp.sendcmd("MDTM " + item_path)
+                        ts = resp.split()[1]
+                        mtime = parse_mdtm_to_unix(ts)
+                    except:
+                        pass
+
+                    rel_path = item_path[len(base_remote):].lstrip("/")
+                    folder_list[rel_path] = (path, mtime)
+
+        walk_ftp(base_remote)
+        ftp.quit()
+
+    return folder_list
+
+def write(rel_path, path, bytes_data):
+    if path["type"] == "folder":
+        base = path["path"]
+        dest = os.path.join(base, rel_path)
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        with open(dest, "wb") as f:
+            f.write(bytes_data)
+
+        return True
+
+    if path["type"] == "zip":
+        zip_path = path["path"]
+        zip_dir = os.path.dirname(zip_path)
+
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip", dir=zip_dir)
+        os.close(tmp_fd)
+
+        try:
+            if os.path.exists(zip_path):
+                with zipfile.ZipFile(zip_path, "r") as zin, \
+                     zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+
+                    for item in zin.infolist():
+                        if item.filename == rel_path:
+                            continue
+                        data = zin.read(item.filename)
+                        zout.writestr(item, data)
+
+                    zout.writestr(rel_path, bytes_data)
+            else:
+                with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+                    zout.writestr(rel_path, bytes_data)
+
+            os.replace(tmp_name, zip_path)
+
+        finally:
+            if os.path.exists(tmp_name) and not os.path.samefile(tmp_name, zip_path):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+
+        return True
+    
+    if path["type"] == "ftp":
+        ftp = FTP()
+        ftp.connect(path["host"])
+        ftp.login(path["username"], path["password"])
+
+        base_remote = path["path"].rstrip("/")
+
+        rel = rel_path.replace("\\", "/")
+        full_remote = base_remote + "/" + rel
+
+        parts = rel.split("/")
+        filename = parts[-1]
+        folders = parts[:-1]
+
+        current = base_remote
+        for folder in folders:
+            try:
+                ftp.mkd(current + "/" + folder)
+            except:
+                pass
+            current = current + "/" + folder
+
+        ftp.cwd(os.path.dirname(full_remote))
+
+        bio = BytesIO(bytes_data)
+        ftp.storbinary("STOR " + filename, bio)
+
+        ftp.quit()
+        return True
+
+    raise ValueError(f"Unknown location type: {path['type']}")
+
+def get_bytes(rel_path, path):
+    if path["type"] == "folder":
+        full_path = os.path.join(path["path"], rel_path)
+        with open(full_path, "rb") as f:
+            return f.read()
+
+    if path["type"] == "zip":
+        zip_path = path["path"]
+        with zipfile.ZipFile(zip_path, "r") as z:
+            with z.open(rel_path, "r") as f:
+                return f.read()
+
+    if path["type"] == "ftp":
+        ftp = FTP()
+        ftp.connect(path["host"])
+        ftp.login(path["username"], path["password"])
+
+        base_remote = path["path"].rstrip("/")
+        rel = rel_path.replace("\\", "/")
+        remote_full = base_remote + "/" + rel
+
+        dirpart = os.path.dirname(remote_full)
+        if dirpart:
+            ftp.cwd(dirpart)
+
+        buffer = BytesIO()
+        filename = os.path.basename(remote_full)
+
+        ftp.retrbinary("RETR " + filename, buffer.write)
+
+        ftp.quit()
+        return buffer.getvalue()
+
+    raise ValueError(f"Unknown location type: {path['type']}")
+
+
+def parse_mdtm_to_unix(ts: str) -> float:
+    """
+    Convert MDTM timestamp like '20251204201800.948' or '20251204201800'
+    to a Unix timestamp (float seconds since epoch).
+    """
+    if "." in ts:
+        dt = datetime.datetime.strptime(ts, "%Y%m%d%H%M%S.%f")
+    else:
+        dt = datetime.datetime.strptime(ts, "%Y%m%d%H%M%S")
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
 
 if __name__ == "__main__":
     main()
