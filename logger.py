@@ -7,6 +7,9 @@ def log_info(msg):
 def log_err(msg):
     print(paint(f"[ERR] {msg}", Color.RED))
 
+def log_important(msg):
+     print(paint(f"[IMPORTANT] {msg}", Color.MAGENTA))
+
 def paint(text, color):
         return f"{color}{text}{Color.RESET}"
 

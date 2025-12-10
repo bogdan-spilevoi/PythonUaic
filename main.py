@@ -1,45 +1,72 @@
+from collections import defaultdict
 import datetime
 from ftplib import FTP
 import os
 from pathlib import Path
+import queue
 import tempfile
 import zipfile
 from path_utilities import is_valid_path, is_valid_file, read_file_safely
 import argparse
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 import time
 from handlers import Handler
 from result import Result
 from io import BytesIO
 import zipfile
-from logger import log, log_err, log_info
+from logger import log, log_err, log_info, log_important
+import threading
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--file", action="store_true")
 args = parser.parse_args()
 
-observer = Observer()
-handlers = []
 paths = []
+event_queue = queue.Queue()
+last_events = {}
+num_watchers = 0
 
 def main():
-
+    global num_watchers, start_barrier, end_barrier
     get_paths()
     if(paths == None or len(paths) == 0):
         return
     
+    num_watchers = len(paths)
+    start_barrier = threading.Barrier(num_watchers + 1)
+    end_barrier   = threading.Barrier(num_watchers + 1) 
     init_sync()
-    return
-    
-    init_handlers(paths)
-    observer.start()
-    
+
+    i = 1
+    for path in paths:
+        threading.Thread(target=watch_file, args=(path,event_queue, last_events, i,), daemon=True).start()
+        i+=1
+
     try:
         while True:
-            time.sleep(1)
+            start_barrier.wait()
+            batch = []
+            last_events.clear()
+
+            try:
+                event = event_queue.get(timeout=1)
+                batch.append(event)
+            except queue.Empty:
+                batch = []
+
+            while True:
+                try:
+                    event = event_queue.get_nowait()
+                    batch.append(event)
+                except queue.Empty:
+                    break
+
+            if batch:
+                handle_batch(batch)
+
+            end_barrier.wait()
+                
     except KeyboardInterrupt:
-        stop_observer()
+        log_info("Program stopped, stopping all watcher threads")
 
 
 def parse_location(spec: str) -> Result:
@@ -145,6 +172,16 @@ def get_paths():
 
 def init_sync():
     log_info("Finding latest files for initial sync.")
+    latest_files = get_latest_files()
+
+    log_info(
+        f"Syncing all to latest files:\n" +
+        "\n".join(f"    [{k}] from [{p["path"]}] version [{time.ctime(t)}]" for k, (p, t) in latest_files.items())
+    )
+    sync_to_latest(latest_files)
+    
+
+def get_latest_files():
     latest_files = {}
     for path in paths:
         files_in_path = ls(path)
@@ -155,51 +192,103 @@ def init_sync():
                     latest_files[rel_path] = (path, mtime)
             else:
                 latest_files[rel_path] = (path, mtime)
+    return latest_files
 
-    log_info(
-        f"Syncing all to latest files:\n" +
-        "\n".join(f"{k}: {v}" for k, v in latest_files.items())
-    )
-
+def sync_to_latest(latest_files):
     for path in paths:
-        files_in_path = ls(path)
-        _, mtime = files_in_path[rel_path]
-        for rel_path, (latest_path, latest_mtime) in latest_files.items():
+        files_in_path = ls(path)       
+        for rel_path, (latest_path, latest_mtime) in latest_files.items():           
             if rel_path not in files_in_path.keys():
                 log(f"File [{rel_path}] not found in [{path["path"]}], writing latest from [{latest_path["path"]}]")
                 write(rel_path, path, get_bytes(rel_path, latest_path))
-            else:               
+            else:          
+                _, mtime = files_in_path[rel_path]     
                 if mtime < latest_mtime:
                     log(f"File [{rel_path}] from [{path["path"]}] [{time.ctime(mtime)}] is behind latest, writing from [{latest_path["path"]}] [{time.ctime(latest_mtime)}]")
                     write(rel_path, path, get_bytes(rel_path, latest_path))
 
+
+def watch_file(path, event_queue, last_events, id):
+    prev = ls(path)
+    log_info(f"Starting daemon watcher at {path["path"]}")
+    while True:
+        curr = ls(path)
+
+        prev_keys = set(prev.keys())
+        curr_keys = set(curr.keys())
+
+        for rel_path in prev_keys & curr_keys:
+            _, prev_mtime = prev[rel_path]
+            _, curr_mtime = curr[rel_path]
+
+            last_type = last_events.get(rel_path, {}).get("type")
+            if curr_mtime > prev_mtime and last_type != "updated":
+                event_queue.put({
+                    "type": "updated",
+                    "location": path,
+                    "rel_path": rel_path,
+                    "mtime": curr_mtime
+                })
+                log(f"T{id}-{time.time()} UPDATED File [{rel_path}] at [{path['path']}]")
+
+        for rel_path in prev_keys - curr_keys:
+            last_type = last_events.get(rel_path, {}).get("type")
+            if last_type == "deleted":
+                continue
+
+            event_queue.put({
+                "type": "deleted",
+                "location": path,
+                "rel_path": rel_path,
+                "mtime": time.time()
+            })
+            log(f"T{id}-{time.time()} DELETED File [{rel_path}] from [{path['path']}]")
+
+        for rel_path in curr_keys - prev_keys:
+            last_type = last_events.get(rel_path, {}).get("type")
+            if last_type == "created":
+                continue
+
+            _, new_mtime = curr[rel_path]
+            event_queue.put({
+                "type": "created",
+                "location": path,
+                "rel_path": rel_path,
+                "mtime": new_mtime
+            })
+            log(f"T{id}-{time.time()} CREATED File [{rel_path}] at [{path['path']}]")
+
+
+        prev = curr
+
+        start_barrier.wait()
+        end_barrier.wait()
+
     
 
+def handle_batch(events):
+    by_rel = defaultdict(list)
+    for ev in events:
+        by_rel[ev["rel_path"]].append(ev)
 
-def init_handlers(paths):   
-    for path in paths:
-        handler = Handler(path, created, modified, deleted, moved)
-        handlers.append(handler)
-        observer.schedule(handler, path, recursive=False)
+    for rel_path, evs in by_rel.items():
+        evs.sort(key=lambda e: e["mtime"])
+        winner = evs[-1]
+        types = {e["type"] for e in evs}
 
-def stop_observer():
-    observer.stop()
-    observer.join()
+        last_events[rel_path] = winner
+        
+        if types == {"deleted"}:
+            log_important(f"MAIN-{time.time()} DELETING {rel_path}")
 
-
-
-def created(root, relative):
-    print("[CREATE]", root, "->", relative)
-
-def modified(root, relative):
-    print("[MODIFY]", root, "->", relative)
-
-def deleted(root, relative):
-    print("[DELETE]", root, "->", relative)
-
-def moved(root, old_rel, new_rel):
-    print("[MOVED]", root, ":", old_rel, "->", new_rel)
-
+            for loc in paths:
+                delete(rel_path, loc)
+        else:
+            data = get_bytes(rel_path, winner["location"])
+            log_important(f"MAIN-{time.time()} WRITING {rel_path}")
+            for loc in paths:
+                if loc is not winner["location"]:
+                    write(rel_path, loc, data)
 
 def ls(path):
     folder_list = {}
@@ -377,12 +466,65 @@ def get_bytes(rel_path, path):
 
     raise ValueError(f"Unknown location type: {path['type']}")
 
+def delete(rel_path, path):
+
+    if path["type"] == "folder":
+        full_path = os.path.join(path["path"], rel_path)
+        if os.path.exists(full_path):
+            os.remove(full_path)
+        return True
+
+
+    if path["type"] == "zip":
+        zip_path = path["path"]
+        zip_dir  = os.path.dirname(zip_path)
+
+        if not os.path.exists(zip_path):
+            return True
+
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip", dir=zip_dir)
+        os.close(tmp_fd)
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zin, zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+
+                for item in zin.infolist():
+                    if item.filename != rel_path:
+                        data = zin.read(item.filename)
+                        zout.writestr(item, data)
+
+            os.replace(tmp_name, zip_path)
+
+        except Exception:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except:
+                    log_err(f"Problem deleting tmp zip file {tmp_name} at {zip_path}")
+            raise
+
+        return True
+
+    if path["type"] == "ftp":
+        ftp = FTP()
+        ftp.connect(path["host"], 21)
+        ftp.login(path["username"], path["password"])
+
+        base_remote = path["path"].rstrip("/")
+        rel = rel_path.replace("\\", "/")
+        remote_full = base_remote + "/" + rel
+
+        try:
+            ftp.delete(remote_full)
+        except:
+            log_err(f"File {rel} does not exist on ftp {base_remote}")
+            pass
+
+        ftp.quit()
+        return True
+
 
 def parse_mdtm_to_unix(ts: str) -> float:
-    """
-    Convert MDTM timestamp like '20251204201800.948' or '20251204201800'
-    to a Unix timestamp (float seconds since epoch).
-    """
     if "." in ts:
         dt = datetime.datetime.strptime(ts, "%Y%m%d%H%M%S.%f")
     else:
@@ -390,7 +532,16 @@ def parse_mdtm_to_unix(ts: str) -> float:
     dt = dt.replace(tzinfo=datetime.timezone.utc)
     return dt.timestamp()
 
+def clear_queue(q: queue.Queue):
+    try:
+        while True:
+            q.get_nowait()
+    except queue.Empty:
+        pass
 
-
+def queue_contains(q, predicate):
+    with q.mutex:
+        return any(predicate(item) for item in q.queue)
+    
 if __name__ == "__main__":
     main()
