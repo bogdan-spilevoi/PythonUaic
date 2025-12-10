@@ -13,6 +13,7 @@ from handlers import Handler
 from result import Result
 from io import BytesIO
 import zipfile
+from logger import log, log_err, log_info
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--file", action="store_true")
@@ -31,7 +32,6 @@ def main():
     init_sync()
     return
     
-    print(paths)
     init_handlers(paths)
     observer.start()
     
@@ -107,13 +107,13 @@ def get_paths():
         line = input("Enter path for paths file: ")
         try_paths_file = is_valid_file(line)
         if not try_paths_file.ok:
-            print(try_paths_file.error)
+            log_err(try_paths_file.error)
             return None
 
         try:
             data = read_file_safely(try_paths_file.value)
         except PermissionError as e:
-            print(f"Could not read paths file: {e}")
+            log_err(f"Could not read paths file: {e}")
             return None
 
         for ln in data.decode(errors="ignore").splitlines():
@@ -123,7 +123,7 @@ def get_paths():
 
             parsed = parse_location(ln)
             if not parsed.ok:
-                print(parsed.error)
+                log_err(parsed.error)
                 continue
 
             paths.append(parsed.value)
@@ -136,7 +136,7 @@ def get_paths():
 
             parsed = parse_location(line)
             if not parsed.ok:
-                print(parsed.error)
+                log_err(parsed.error)
                 continue
 
             paths.append(parsed.value)
@@ -144,10 +144,10 @@ def get_paths():
     return paths
 
 def init_sync():
+    log_info("Finding latest files for initial sync.")
     latest_files = {}
     for path in paths:
         files_in_path = ls(path)
-        #print(files_in_path)
         for rel_path, (path, mtime) in files_in_path.items():
             if rel_path in latest_files:
                 _, existing_mtime = latest_files[rel_path]
@@ -156,18 +156,21 @@ def init_sync():
             else:
                 latest_files[rel_path] = (path, mtime)
 
-    #print("Latest files", latest_files)
+    log_info(
+        f"Syncing all to latest files:\n" +
+        "\n".join(f"{k}: {v}" for k, v in latest_files.items())
+    )
+
     for path in paths:
         files_in_path = ls(path)
         _, mtime = files_in_path[rel_path]
         for rel_path, (latest_path, latest_mtime) in latest_files.items():
             if rel_path not in files_in_path.keys():
-                print(f"[LOG] File [{rel_path}] not found in [{path["path"]}], writing latest from [{latest_path["path"]}]")
+                log(f"File [{rel_path}] not found in [{path["path"]}], writing latest from [{latest_path["path"]}]")
                 write(rel_path, path, get_bytes(rel_path, latest_path))
             else:               
-                #print(f"[LOG] {time.ctime(mtime)} < {time.ctime(latest_mtime)}")
                 if mtime < latest_mtime:
-                    print(f"[LOG] File [{rel_path}] from [{path["path"]}] [{time.ctime(mtime)}] is behind latest, writing from [{latest_path["path"]}] [{time.ctime(latest_mtime)}]")
+                    log(f"File [{rel_path}] from [{path["path"]}] [{time.ctime(mtime)}] is behind latest, writing from [{latest_path["path"]}] [{time.ctime(latest_mtime)}]")
                     write(rel_path, path, get_bytes(rel_path, latest_path))
 
     
@@ -283,8 +286,7 @@ def write(rel_path, path, bytes_data):
 
         try:
             if os.path.exists(zip_path):
-                with zipfile.ZipFile(zip_path, "r") as zin, \
-                     zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
+                with zipfile.ZipFile(zip_path, "r") as zin, zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zout:
 
                     for item in zin.infolist():
                         if item.filename == rel_path:
@@ -304,7 +306,7 @@ def write(rel_path, path, bytes_data):
                 try:
                     os.remove(tmp_name)
                 except OSError:
-                    pass
+                    log_err(f"OS Error when removing tmp zip file {tmp_name}")
 
         return True
     
@@ -327,7 +329,7 @@ def write(rel_path, path, bytes_data):
             try:
                 ftp.mkd(current + "/" + folder)
             except:
-                pass
+                log_err(f"Problem when making dir in FTP {base_remote}")
             current = current + "/" + folder
 
         ftp.cwd(os.path.dirname(full_remote))
