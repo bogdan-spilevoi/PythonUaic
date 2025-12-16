@@ -23,7 +23,7 @@ parser.add_argument("--file", action="store_true")
 args = parser.parse_args()
 
 paths: List[Dict[str, Any]] = []
-event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
 last_events: Dict[str, Dict[str, Any]] = {}
 num_watchers: int = 0
 
@@ -257,12 +257,7 @@ def sync_to_latest(latest_files: Dict[str, Tuple[Dict[str, Any], float]]) -> Non
                     write(rel_path, path, get_bytes(rel_path, latest_path))
 
 
-def watch_file(
-    path: Dict[str, Any],
-    event_queue: "queue.Queue[Dict[str, Any]]",
-    last_events: Dict[str, Dict[str, Any]],
-    watcher_id: int,
-) -> None:
+def watch_file(path: Dict[str, Any], event_queue: queue.Queue[Dict[str, Any]], last_events: Dict[str, Dict[str, Any]], watcher_id: int,) -> None:
     """Watch a single location for file changes and enqueue events."""
     global start_barrier, end_barrier
 

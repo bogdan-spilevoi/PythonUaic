@@ -173,15 +173,4 @@ Potential features:
 - Web dashboard showing sync status
 - Async I/O or watchdog integration for faster detection
 
----
 
-## ❤️ Contributing
-
-Pull requests and suggestions are welcome.  
-Let me know if you'd like a `CONTRIBUTING.md` template.
-
----
-
-## 📫 Support
-
-If you need help setting up new storage types, adding features, or packaging this as a pip module, feel free to ask.

@@ -24,7 +24,7 @@ class Result(Generic[T, E]):
     error: Optional[E] = None
 
     @staticmethod
-    def Ok(value: Optional[T] = None) -> "Result[T, E]":
+    def Ok(value: Optional[T] = None) -> Result[T, E]:
         """Create a successful result.
 
         Args:
@@ -36,7 +36,7 @@ class Result(Generic[T, E]):
         return Result(True, value=value)
 
     @staticmethod
-    def Err(error: E) -> "Result[T, E]":
+    def Err(error: E) -> Result[T, E]:
         """Create a failed result.
 
         Args:

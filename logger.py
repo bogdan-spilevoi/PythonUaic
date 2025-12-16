@@ -29,24 +29,24 @@ def paint(text: str, color: Color) -> str:
     Returns:
         The colorized text.
     """
-    return f"{color}{text}{Color.RESET}"
+    return f"{color}{text}{Color.RESET.value}"
 
 
 def log(msg: str) -> None:
     """Log a general message."""
-    print(paint(f"[LOG] {msg}", Color.YELLOW))
+    print(paint(f"[LOG] {msg}", Color.YELLOW.value))
 
 
 def log_info(msg: str) -> None:
     """Log an informational message."""
-    print(paint(f"[INFO] {msg}", Color.BLUE))
+    print(paint(f"[INFO] {msg}", Color.BLUE.value))
 
 
 def log_err(msg: str) -> None:
     """Log an error message."""
-    print(paint(f"[ERR] {msg}", Color.RED))
+    print(paint(f"[ERR] {msg}", Color.RED.value))
 
 
 def log_important(msg: str) -> None:
     """Log an important message."""
-    print(paint(f"[IMPORTANT] {msg}", Color.MAGENTA))
+    print(paint(f"[IMPORTANT] {msg}", Color.MAGENTA.value))
